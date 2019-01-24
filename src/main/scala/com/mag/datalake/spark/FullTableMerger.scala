@@ -1,6 +1,8 @@
 package com.mag.datalake.spark
 
-import org.apache.spark.sql.{SparkSession, functions}
+import org.apache.spark.sql.expressions.Window
+import org.apache.spark.sql.types._
+import org.apache.spark.sql.{DataFrame, SparkSession, functions}
 
 object FullTableMerger {
 
@@ -11,14 +13,14 @@ object FullTableMerger {
       SYNTAX
       ========
 
-      spark2-submit --class com.mag.datalake.spark.DistTableMerger \
+      spark2-submit --class com.mag.datalake.spark.FullTableMerger \
       "JDBC URL" \
       "UserName" \
       "Password" \
       "Source JDBC Table" \
       "Source Hive Table for comparison" \
       "Staging or Target Hive Table" \
-      "Business Key Columns ',' separated "
+      "Partition Column"
 
       EXAMPLE
       =========
@@ -30,7 +32,7 @@ object FullTableMerger {
       "EXTERNAL.veh_stop" \
       "pta_avm_raw.veh_stop" \
       "pta_avm_stg.veh_stop" \
-      "event_no,opd_date"
+      "event_no"
 
    */
 
@@ -53,12 +55,15 @@ object FullTableMerger {
 
     val stgHiveTableName = args(5)
 
+    val partitionColumn = args(6)
+
     val jdbcDriver = jdbcURL match {
 
       case source if source.contains("oracle") => "oracle.jdbc.driver.OracleDriver"
       case source if source.contains("mysql") => "com.mysql.jdbc.Driver"
       case source if source.contains("sqlserver") => "com.microsoft.sqlserver.jdbc.SQLServerDriver"
-      case source if source.contains("postgresql") =>   "org.postgresql.Driver"
+      case source if source.contains("postgresql") => "org.postgresql.Driver"
+      case source if source.contains("db2") => "com.ibm.db2.jcc.DB2Driver"
     }
 
     val properties = new java.util.Properties()
@@ -67,19 +72,23 @@ object FullTableMerger {
     properties.put("driver", jdbcDriver)
     properties.put("dbtable", tableName)
 
-    val jdbcDF = spark.read.jdbc(jdbcURL, tableName, properties)
-
-    jdbcDF.cache()
-
     val hiveQuery = s"""SELECT * from $hiveTableName""".stripMargin
 
-    val hiveDF = spark.sql(hiveQuery)
+    val hiveDF = spark.sql(hiveQuery).cache()
 
     val colName = for (c <- hiveDF.columns) yield c + "1"
 
-    val hiveDFRenamed = hiveDF.toDF(colName : _*).withColumn("du33yz", org.apache.spark.sql.functions.lit(""))
+    val partitionCount = getPartitionCount(hiveDF.count())
 
-    hiveDFRenamed.cache()
+    val partitionRanges = getPartitionRanges(hiveDF.select(partitionColumn), partitionColumn, partitionCount)
+
+    val jdbcSchema = spark.read.jdbc(jdbcURL, tableName, properties)
+
+    val predicates = getPredicates(jdbcURL, jdbcSchema.toDF(), partitionColumn, partitionRanges)
+
+    val jdbcDF = spark.read.jdbc(jdbcURL, tableName, predicates, properties).cache()
+
+    val hiveDFRenamed = hiveDF.toDF(colName: _*).withColumn("du33yz", org.apache.spark.sql.functions.lit(""))
 
     val joinExprs = jdbcDF.columns.zip(hiveDFRenamed.columns)
       .map { case (c1, c2) => jdbcDF(c1) <=> hiveDFRenamed(c2) }.reduce(_ && _)
@@ -88,6 +97,77 @@ object FullTableMerger {
       .select(jdbcDF.columns.head, jdbcDF.columns.tail: _*).write.insertInto(stgHiveTableName)
 
     spark.close()
+
+  }
+
+
+  def getPartitionCount(totalRows: Long): Int = {
+
+    val rowsPerConnection = 200000
+
+    totalRows match {
+
+      case x if x < 50000 => 1
+      case x if x > 50000 && x <= rowsPerConnection => 2
+      case x if x > rowsPerConnection => scala.math.ceil(totalRows.toFloat / rowsPerConnection).toInt
+
+    }
+  }
+
+
+  def getPartitionRanges(df: DataFrame, partitionCol: String, partitionCount: Int): List[String] = {
+
+    val rowCount = df.count()
+
+    val rowsPerPartition = rowCount / partitionCount
+
+    val rowNos = (rowsPerPartition to (rowCount - rowsPerPartition) by rowsPerPartition).toList
+
+    val colDF = df.withColumn("row_no", functions.row_number().over(Window.orderBy(partitionCol))).cache()
+
+    colDF.filter(functions.col("row_no").isin(rowNos: _*)).select(partitionCol).collect().map(_ (0).toString).toList
+
+  }
+
+
+  def getPredicates(jdbcURL: String, df: DataFrame, partitionCol: String, partitionRanges: List[String]): Array[String] = {
+
+    val colType = df.schema.fields(df.schema.fieldNames.map(_.toLowerCase).indexOf(partitionCol)).dataType
+
+    colType match {
+
+      case _: ShortType | _: IntegerType | _: LongType | _: DoubleType | _: FloatType | _: DecimalType => {
+
+        val l = partitionRanges.toSet.toList
+        var r = s"""$partitionCol < ${l.head}""" :: List[String]()
+        r = s"""$partitionCol >= ${l.last}""" :: r
+
+        if (l.size > 1) {
+
+          for (List(left, right) <- l.sliding(2)) {
+            r = s"""$partitionCol >= $left AND $partitionCol < $right""" :: r
+          }
+        }
+
+        r.toArray
+      }
+
+      case _: StringType | _: VarcharType => {
+
+        val l = partitionRanges.toSet.toList
+        var r = s"""$partitionCol < '${l.head}'""" :: List[String]()
+        r = s"""$partitionCol >= '${l.last}'""" :: r
+
+        if (l.size > 1) {
+
+          for (List(left, right) <- l.sliding(2)) {
+            r = s"""$partitionCol >= '$left' AND $partitionCol < '$right'""" :: r
+          }
+        }
+        r.toArray
+      }
+
+    }
 
   }
 
