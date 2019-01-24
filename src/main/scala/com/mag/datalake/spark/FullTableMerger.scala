@@ -141,6 +141,7 @@ object FullTableMerger {
         val l = partitionRanges.toSet.toList
         var r = s"""$partitionCol < ${l.head}""" :: List[String]()
         r = s"""$partitionCol >= ${l.last}""" :: r
+        r = s"""$partitionCol is NULL""" :: r
 
         if (l.size > 1) {
 
@@ -157,6 +158,7 @@ object FullTableMerger {
         val l = partitionRanges.toSet.toList
         var r = s"""$partitionCol < '${l.head}'""" :: List[String]()
         r = s"""$partitionCol >= '${l.last}'""" :: r
+        r = s"""$partitionCol is NULL""" :: r
 
         if (l.size > 1) {
 
