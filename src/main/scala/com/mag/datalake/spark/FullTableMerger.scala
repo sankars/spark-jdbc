@@ -57,6 +57,8 @@ object FullTableMerger {
 
     val partitionColumn = args(6)
 
+    val maxPartitions = if (args.length == 8) args(7).toInt else 50
+
     val jdbcDriver = jdbcURL match {
 
       case source if source.contains("oracle") => "oracle.jdbc.driver.OracleDriver"
@@ -78,7 +80,7 @@ object FullTableMerger {
 
     val colName = for (c <- hiveDF.columns) yield c + "1"
 
-    val partitionCount = getPartitionCount(hiveDF.count())
+    val partitionCount = getPartitionCount(hiveDF.count(), maxPartitions)
 
     val partitionRanges = getPartitionRanges(hiveDF.select(partitionColumn), partitionColumn, partitionCount)
 
@@ -101,7 +103,7 @@ object FullTableMerger {
   }
 
 
-  def getPartitionCount(totalRows: Long): Int = {
+  def getPartitionCount(totalRows: Long, maxPartitions: Int): Int = {
 
     val rowsPerConnection = 200000
 
@@ -109,7 +111,7 @@ object FullTableMerger {
 
       case x if x < 50000 => 1
       case x if x > 50000 && x <= rowsPerConnection => 2
-      case x if x > rowsPerConnection => scala.math.ceil(totalRows.toFloat / rowsPerConnection).toInt
+      case x if x > rowsPerConnection => scala.math.min(maxPartitions, scala.math.ceil(totalRows.toFloat / rowsPerConnection).toInt)
 
     }
   }
