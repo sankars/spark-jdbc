@@ -74,7 +74,7 @@ object DistTableMerger {
 
     val totalDays = Days.daysBetween(DateTime.parse(startDate).toLocalDate(), DateTime.parse(endDate).toLocalDate()).getDays()
 
-    val predicates = for (n <- 1 to (totalDays / daysPerTask)) yield s"""$dateColumnName >= TO_DATE('$startDate', 'YYYY-MM-DD') + ${(n - 1) * daysPerTask}  AND $dateColumnName <  TO_DATE('$startDate', 'YYYY-MM-DD') + ${math.min(totalDays, n * daysPerTask)}"""
+    val predicates = for (n <- 1 to math.ceil(totalDays.toFloat / daysPerTask).toInt) yield s"""$dateColumnName >= TO_DATE('$startDate', 'YYYY-MM-DD') + ${(n - 1) * daysPerTask}  AND $dateColumnName <  TO_DATE('$startDate', 'YYYY-MM-DD') + ${math.min(totalDays, n * daysPerTask)}"""
 
     val jdbcDriver = jdbcURL match {
 
