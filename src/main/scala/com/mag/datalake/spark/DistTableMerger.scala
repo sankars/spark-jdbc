@@ -1,6 +1,6 @@
 package com.mag.datalake.spark
 
-import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.{SparkSession, functions}
 import org.joda.time.{DateTime, Days}
 
 object DistTableMerger {
@@ -96,15 +96,18 @@ object DistTableMerger {
     jdbcDF.cache()
 
     val hiveQuery =
-      s"""SELECT $joinColumns , "" AS du33yz from $hiveTableName where $dateColumnName between CAST("$startDate" as timestamp) and CAST("$endDate" as timestamp)""".stripMargin
-    println(s"hiveQuery : $hiveQuery")
+      s"""SELECT $joinColumns from $hiveTableName where $dateColumnName between CAST("$startDate" as timestamp) and CAST("$endDate" as timestamp)""".stripMargin
 
-    val hiveDF = spark.sql(hiveQuery)
+    val hiveDF = spark.sql(hiveQuery).cache()
 
-    hiveDF.cache()
+    val colName = for (c <- hiveDF.columns) yield c + "1"
 
-    jdbcDF.join(hiveDF, joinColumns.split(",").toSeq, "left").filter("du33yz is null")
-      .drop("du33yz").select(jdbcDF.columns.head, jdbcDF.columns.tail: _*).write.insertInto(stgHiveTableName)
+    val hiveDFRenamed = hiveDF.toDF(colName: _*).withColumn("du33yz", functions.lit(""))
+
+    val joinExpr = joinColumns.split(",").map(c => jdbcDF(c) <=> hiveDFRenamed(c + "1")).reduce(_ && _)
+
+    jdbcDF.join(hiveDFRenamed, joinExpr, "left").filter("du33yz is null")
+      .select(jdbcDF.columns.head, jdbcDF.columns.tail: _*).write.insertInto(stgHiveTableName)
 
     spark.close()
 
