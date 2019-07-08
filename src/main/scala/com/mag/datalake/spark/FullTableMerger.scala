@@ -1,5 +1,6 @@
 package com.mag.datalake.spark
 
+import org.apache.log4j.Logger
 import org.apache.spark.sql.expressions.Window
 import org.apache.spark.sql.types._
 import org.apache.spark.sql.{DataFrame, SparkSession, functions}
@@ -41,6 +42,8 @@ object FullTableMerger {
       "dry-run"
 
    */
+
+  val log = Logger.getLogger(FullTableMerger.getClass())
 
   def main(args: Array[String]): Unit = {
 
@@ -102,11 +105,15 @@ object FullTableMerger {
 
     val cdcQuery = s"""SELECT * FROM $hiveTableName""".stripMargin
 
-    val dryRunQuery = s"""SELECT $partitionColumn FROM $tableName LIMIT $samplingThreshold""".stripMargin
+    log.info(s"""cdcQuery : $cdcQuery""")
+
+    val dryRunQuery = s"""(SELECT $partitionColumn FROM $tableName WHERE ROWNUM <= $samplingThreshold) tbl""".stripMargin
+
+    log.info(s"""dryRunQuery : $dryRunQuery""")
 
     val samplingDF = mode match {
       case "cdc" => spark.sql(cdcQuery).cache()
-      case "dry-run" => spark.read.jdbc(jdbcURL, s"""($dryRunQuery) tbl""", properties).cache()
+      case "dry-run" => spark.read.jdbc(jdbcURL, s"""$dryRunQuery""", properties).cache()
       case _ => println("Doing CDC"); spark.sql(cdcQuery).cache();
 
     }
@@ -119,9 +126,9 @@ object FullTableMerger {
 
     val rangeDF = if (rowCount < samplingThreshold) samplingDF.select(partitionColumn) else samplingDF.sample(false, 0.05).select(partitionColumn)
 
-    val partitionRanges = getPartitionRanges(rangeDF, partitionColumn, partitionCount)
-
     val jdbcSchema = spark.read.jdbc(jdbcURL, tableName, properties)
+
+    val partitionRanges = getPartitionRanges(rangeDF, partitionColumn, partitionCount)
 
     val predicates = getPredicates(jdbcURL, jdbcSchema.toDF(), partitionColumn, partitionRanges)
 
@@ -140,7 +147,7 @@ object FullTableMerger {
 
     else if (mode == "dry-run") {
 
-      jdbcDF.write.insertInto(stgHiveTableName)
+      jdbcDF.write.saveAsTable(stgHiveTableName)
     }
 
     spark.close()
@@ -152,27 +159,46 @@ object FullTableMerger {
 
     val rowsPerConnection = 200000
 
-    totalRows match {
+    log.debug(s"getPartitionCount(totalRows = $totalRows, maxPartitions = $maxPartitions )")
+
+    val partitionCount = totalRows match {
 
       case x if x < 50000 => 1
       case x if x > 50000 && x <= rowsPerConnection => 2
       case x if x > rowsPerConnection => scala.math.min(maxPartitions, scala.math.ceil(totalRows.toFloat / rowsPerConnection).toInt)
 
     }
+
+    log.info(s"No of Partitions = $partitionCount")
+
+    partitionCount
+
   }
 
 
   def getPartitionRanges(df: DataFrame, partitionColumn: String, partitionCount: Int): List[String] = {
 
-    val rowCount = df.count()
+    log.debug(s"getPartitionRanges(df, partitionColumn = $partitionColumn, partitionCount = $partitionCount )")
 
-    val rowsPerPartition = rowCount / partitionCount
+    var partitionRanges = List[String]()
 
-    val rowNos = (rowsPerPartition to (rowCount - rowsPerPartition) by rowsPerPartition).toList
+    if (partitionCount > 1) {
 
-    val colDF = df.withColumn("row_no", functions.row_number().over(Window.orderBy(partitionColumn))).cache()
+      val rowCount = df.count()
 
-    colDF.filter(functions.col("row_no").isin(rowNos: _*)).select(partitionColumn).collect().map(_ (0).toString).toList
+      val rowsPerPartition = rowCount / partitionCount
+
+      val rowNos = (rowsPerPartition to (rowCount - rowsPerPartition) by rowsPerPartition).toList
+
+      val colDF = df.withColumn("row_no", functions.row_number().over(Window.orderBy(partitionColumn))).cache()
+
+      partitionRanges = colDF.filter(functions.col("row_no").isin(rowNos: _*)).select(partitionColumn).collect().map(_ (0).toString).toList
+
+    }
+
+    log.debug(s"""List of Partition Ranges ==> ${partitionRanges.mkString("[", ",", "]")}""")
+
+    partitionRanges
 
   }
 
@@ -185,35 +211,65 @@ object FullTableMerger {
 
       case _: ShortType | _: IntegerType | _: LongType | _: DoubleType | _: FloatType | _: DecimalType => {
 
-        val l = partitionRanges.toSet.toList
-        var r = s"""$partitionColumn < ${l.head}""" :: List[String]()
-        r = s"""$partitionColumn >= ${l.last}""" :: r
-        r = s"""$partitionColumn is NULL""" :: r
+        var predicates = List[String]()
 
-        if (l.size > 1) {
+        if (partitionRanges.isEmpty) {
 
-          for (List(left, right) <- l.sliding(2)) {
-            r = s"""$partitionColumn >= $left AND $partitionColumn < $right""" :: r
-          }
+          predicates = s"""1 = 1""" :: predicates
+
         }
 
-        r.toArray
+        else {
+
+          val l = partitionRanges.toSet.toList
+          predicates = s"""$partitionColumn < ${l.head}""" :: predicates
+          predicates = s"""$partitionColumn >= ${l.last}""" :: predicates
+          predicates = s"""$partitionColumn is NULL""" :: predicates
+
+          if (l.size > 1) {
+
+            for (List(left, right) <- l.sliding(2)) {
+              predicates = s"""$partitionColumn >= $left AND $partitionColumn < $right""" :: predicates
+            }
+          }
+
+        }
+
+
+        log.debug(s"""List of Predicates ==> ${predicates.mkString("[", ",", "]")}""")
+
+        predicates.toArray
       }
 
       case _: StringType | _: VarcharType => {
 
-        val l = partitionRanges.toSet.toList
-        var r = s"""$partitionColumn < '${l.head}'""" :: List[String]()
-        r = s"""$partitionColumn >= '${l.last}'""" :: r
-        r = s"""$partitionColumn is NULL""" :: r
+        var predicates = List[String]()
 
-        if (l.size > 1) {
+        if (partitionRanges.isEmpty) {
 
-          for (List(left, right) <- l.sliding(2)) {
-            r = s"""$partitionColumn >= '$left' AND $partitionColumn < '$right'""" :: r
-          }
+          predicates = s"""1 = 1""" :: predicates
+
         }
-        r.toArray
+
+        else {
+
+          val l = partitionRanges.toSet.toList
+          predicates = s"""$partitionColumn < '${l.head}'""" :: List[String]()
+          predicates = s"""$partitionColumn >= '${l.last}'""" :: predicates
+          predicates = s"""$partitionColumn is NULL""" :: predicates
+
+          if (l.size > 1) {
+
+            for (List(left, right) <- l.sliding(2)) {
+              predicates = s"""$partitionColumn >= '$left' AND $partitionColumn < '$right'""" :: predicates
+            }
+          }
+
+        }
+
+        log.debug(s"""List of Predicates ==> ${predicates.mkString("[", ",", "]")}""")
+
+        predicates.toArray
       }
 
     }
